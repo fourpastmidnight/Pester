@@ -185,7 +185,7 @@ function ConvertTo-PesterResult {
         return $testResult
     }
 
-    if (@('PesterAssertionFailed', 'PesterTestSkipped', 'PesterTestInconclusive', 'PesterTestPending') -contains $ErrorRecord.FullyQualifiedErrorID) {
+    if (@('PesterAssertionFailed', 'PesterTestSkipped', 'PesterTestInconclusive', 'PesterTestPending', 'PesterUndefinedGherkinStep', 'PesterPendingGherkinStep') -contains $ErrorRecord.FullyQualifiedErrorID) {
         # we use TargetObject to pass structured information about the error.
         $details = $ErrorRecord.TargetObject
 
@@ -198,6 +198,8 @@ function ConvertTo-PesterResult {
             PesterTestInconclusive { $testResult.Result = "Inconclusive"; break; }
             PesterTestPending { $testResult.Result = "Pending"; break; }
             PesterTestSkipped { $testResult.Result = "Skipped"; break; }
+            PesterUndefinedGherkinStep { $testResult.Result = "Inconclusive"; break; }
+            PesterPendingGherkinStep { $testResult.Result = "Pending"; break; }
         }
     } else {
         $failureMessage = $ErrorRecord.ToString()
@@ -308,6 +310,18 @@ function Write-PesterResult {
                             & $SafeCommands['Write-Host'] -ForegroundColor $ReportTheme.PendingTime $humanTime
                         }
                     }
+
+                    if ($TestResult.ErrorRecord.FullyQualifiedErrorId -eq 'PesterPendingGherkinStep') {
+                        if($pester.IncludeVSCodeMarker) {
+                            & $SafeCommands['Write-Host'] -ForegroundColor $ReportTheme.Pending $($TestResult.failureMessage -replace '(?m)^',($error_margin*2))
+                            & $SafeCommands['Write-Host'] -ForegroundColor $ReportTheme.Pending $($TestResult.stackTrace -replace '(?m)^',($error_margin*2))
+                        } else {
+                            $TestResult |
+                            foreach { ,($_.ErrorRecord.Exception.Message -replace "Exception: ","") + $_.StackTrace -split "\r?\n" } |
+                            & $SafeCommands['Select-Object'] -Index 0,1,3 |
+                            foreach { & $SafeCommands['Write-Host'] -ForegroundColor $ReportTheme.Pending ($_ -replace '(?m)^',($error_margin*2))}
+                        }
+                    }
                     break
                 }
 
@@ -341,6 +355,153 @@ function Write-PesterResult {
             }
         }
     }
+}
+
+function Write-GherkinReport {
+    param (
+        [Parameter(Mandatory = $True, ValueFromPipeline = $True)]
+        $PesterState
+    )
+
+    if (-not ($PesterState.Show | Has-Flag Summary)) { return }
+
+    $Success, $Failure = if($PesterState.FailedCount -gt 0) {
+                            $ReportTheme.Foreground, $ReportTheme.Fail
+                         } else {
+                            $ReportTheme.Pass, $ReportTheme.Information
+                         }
+    $Skipped = if($PesterState.SkippedCount -gt 0) { $ReportTheme.Skipped } else { $ReportTheme.Information }
+    $Pending = if($PesterState.PendingCount -gt 0) { $ReportTheme.Pending } else { $ReportTheme.Information }
+    $Inconclusive = if($PesterState.InconclusiveCount -gt 0) { $ReportTheme.Inconclusive } else { $ReportTheme.Information }
+
+    Try {
+        $PesterStatePassedScenariosCount = $PesterState.PassedScenarios.Count
+    }
+    Catch {
+        $PesterStatePassedScenariosCount = 0
+    }
+
+    Try {
+        $PesterStateFailedScenariosCount = $PesterState.FailedScenarios.Count
+    }
+    Catch {
+        $PesterStateFailedScenariosCount = 0
+    }
+
+    Try {
+        $PesterStatePendingScenariosCount = $PesterState.PendingScenarios.Count
+    }
+    Catch {
+        $PesterStatePendingScenariosCount = 0
+    }
+
+    Try {
+        $PesterStateUndefinedScenariosCount = $PesterState.UndefinedScenarios.Count
+    }
+    Catch {
+        $PesterStateUndefinedScenariosCount = 0
+    }
+
+    $PesterStateTotalScenariosCount = $PesterStateFailedScenariosCount + $PesterStateUndefinedScenariosCount + $PesterStatePendingScenariosCount + $PesterStatePassedScenariosCount
+
+    if($ReportStrings.ContextsPassed) {
+        [string[]]$PesterStateScenarioSummaryCounts = ,($ReportStrings.ContextSummary -f $PesterStateTotalScenariosCount)
+        if ($PesterStateTotalScenariosCount -eq 1) {
+            $PesterStateScenarioSummaryCounts[0] = $PesterStateScenarioSummaryCounts[0] -replace "scenarios","scenario"
+        }
+
+        $PesterStateScenarioSummaryCounts += @(($ReportStrings.ContextsFailed    -f $PesterStateFailedScenariosCount),
+                                               ($ReportStrings.ContextsUndefined -f $PesterStateUndefinedScenariosCount),
+                                               ($ReportStrings.ContextsPending   -f $PesterStatePendingScenariosCount),
+                                               ($ReportStrings.ContextsPassed    -f $PesterStatePassedScenariosCount))
+
+        $PesterStateScenarioSummaryData = $PesterStateScenarioSummaryCounts | & $SafeCommands["ForEach-Object"] {
+            $_ -match "^(?<ScenarioCount>\d+) (?<Result>failed|undefined|pending|passed|scenarios \()" | Out-Null
+            switch ($Matches['Result']) {
+                failed    { $Foreground = $Failure                }
+                undefined { $Foreground = $Inconclusive           }
+                pending   { $Foreground = $Pending                }
+                passed    { $Foreground = $Success                }
+                default   { $Foreground = $ReportTheme.Foreground }
+            }
+
+            if ($Matches['ScenarioCount'] -gt 0) {
+                [PSCustomObject]@{ Foreground = $Foreground; Text = $_ }
+            }
+        }
+
+        & $SafeCommands['Write-Host'] ''
+        for ($i = 0; $i -lt $PesterStateScenarioSummaryData.Length; $i++) {
+            $summaryData = $PesterStateScenarioSummaryData[$i]
+            if ($i -eq $PesterStateScenarioSummaryData.Length - 1) {
+                & $SafeCommands['Write-Host'] ($summaryData.Text -replace ", ",'') -Foreground $summaryData.Foreground -NoNewLine
+                & $SafeCommands['Write-Host'] ")" -Foreground $ReportTheme.Foreground
+            } else {
+                & $SafeCommands['Write-Host'] $summaryData.Text -Foreground $summaryData.Foreground -NoNewLine
+                if ($i) {
+                    &$SafeCommands['Write-Host'] ", " -Foreground $ReportTheme.Foreground -NoNewLine
+                }
+            }
+        }
+    }
+    if($ReportStrings.TestsPassed) {
+        $PesterStateTotalStepsCount = $PesterState.FailedCount + $PesterState.Inconclusive + $PesterState.SkippedCount + $PesterState.PendingCount + $PesterState.PassedCount
+        [string[]]$PesterStateStepSummaryCounts = ,($ReportStrings.TestsSummary -f $PesterStateTotalStepsCount)
+        if ($PesterStateTotalStepCount -eq 1) {
+            $PesterStateStepSummaryCounts[0] = $PesterStateStepSummaryCounts[0] -replace "steps","step"
+        }
+
+        $PesterStateStepSummaryCounts += @(($ReportStrings.TestsFailed       -f $PesterState.FailedCount),
+                                           ($ReportStrings.TestsInconclusive -f $PesterState.InconclusiveCount),
+                                           ($ReportStrings.TestsSkipped      -f $PesterState.SkippedCount),
+                                           ($ReportStrings.TestsPending      -f $PesterState.PendingCount),
+                                           ($ReportStrings.TestsPassed       -f $PesterState.PassedCount))
+
+        $PesterStateStepSummaryData = $PesterStateStepSummaryCounts | & $SafeCommands["ForEach-Object"] {
+            $_ -match "^(?<StepCount>\d+) (?<Result>failed|undefined|skipped|pending|passed|steps \()" | Out-Null
+            switch ($Matches['Result']) {
+                failed    { $Foreground = $Failure                }
+                undefined { $Foreground = $Inconclusive           }
+                skipped   { $Foreground = $Skipped                }
+                pending   { $Foreground = $Pending                }
+                passed    { $Foreground = $Success                }
+                default   { $Foreground = $ReportTheme.Foreground }
+            }
+
+            if ($Matches['StepCount'] -gt 0) {
+                [PSCustomObject]@{ Foreground = $Foreground; Text = $_ }
+            }
+        }
+
+        for ($i = 0; $i -lt $PesterStateStepSummaryData.Length; $i++) {
+            $summaryData = $PesterStateStepSummaryData[$i]
+            if ($i -eq $PesterStateStepSummaryData.Length - 1) {
+                & $SafeCommands['Write-Host'] ($summaryData.Text -replace ", ",'') -Foreground $summaryData.Foreground -NoNewLine
+                & $SafeCommands['Write-Host'] ")" -Foreground $ReportTheme.Foreground
+            } else {
+                & $SafeCommands['Write-Host'] $summaryData.Text -Foreground $summaryData.Foreground -NoNewLine
+                if ($i) {
+                    &$SafeCommands['Write-Host'] ", " -Foreground $ReportTheme.Foreground -NoNewLine
+                }
+            }
+        }
+    }
+
+    & $SafeCommands['Write-Host'] ($ReportStrings.Timing -f (Get-HumanTime $PesterState.Time.TotalSeconds)) -Foreground $ReportTheme.Foreground
+    & $SafeCommands['Write-Host'] ''
+
+    # TODO: Can we create a method that would auto-generate the Step Definition script blocks to the console for undefined steps?
+
+    # {Count} Scenario(s?) ({FailedCount} failed, {UndefinedCount} undefined, {PendingCount} pending, {PassedCount} passed)
+    # {Count} Step(s?) ({FailedCount} failed, {UndefinedCount} undefined, {SkippedCount} skipped, {PendingCount} pending, {PassedCount} passed)
+    # 0m0.002s
+    #
+    # You can implement step definitions for undefined steps with these snippets:
+    #
+    # Given "the input '(.*?)'" {
+    #     param($arg1)
+    #     Set-TestPending
+    # }
 }
 
 function Write-PesterReport {
